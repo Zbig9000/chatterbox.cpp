@@ -51,6 +51,23 @@ def make_hook(storage: dict, name: str, multi_call: bool = False):
     return hook
 
 
+def make_first_call_hook(storage: dict, name: str, transform=None):
+    """Capture only the FIRST forward call's output (with optional transform).
+
+    Used for stage_G2 intermediates (cfm_h_conv, cfm_h_ln) which the C++
+    test harness expects with no _callN suffix and only needs from CFM step 0.
+    """
+    seen = {"n": 0}
+    def hook(_module, _inputs, output):
+        if seen["n"] > 0:
+            return
+        if isinstance(output, torch.Tensor):
+            t = output if transform is None else transform(output)
+            storage[name] = t.detach().clone().cpu()
+        seen["n"] += 1
+    return hook
+
+
 def save(t, path: Path):
     if torch.is_tensor(t):
         arr = t.detach().cpu().contiguous().numpy()
@@ -152,6 +169,21 @@ def main():
     hooks.append(d0_rn.mlp.register_forward_hook(make_hook(storage, "cfm_d0_rn_mlp", multi_call=True)))
     hooks.append(d0_rn.res_conv.register_forward_hook(make_hook(storage, "cfm_d0_rn_res", multi_call=True)))
     hooks.append(d0_rn.register_forward_hook(make_hook(storage, "cfm_d0_rn", multi_call=True)))
+    # G2-gap fix: capture h_conv (after CausalConv1d, before LN) and h_ln
+    # (after LayerNorm, after the second Transpose back to (B, C, T)).  Only
+    # the first call (CFM step 0) is captured because stage_G2 in
+    # test_s3gen.cpp loads cfm_step0_* inputs and expects matching G2
+    # intermediates.  block1.block layout per CausalBlock1D:
+    #   [0] CausalConv1d   -> (B, C, T)
+    #   [1] Transpose(1,2) -> (B, T, C)
+    #   [2] LayerNorm      -> (B, T, C)
+    #   [3] Transpose(1,2) -> (B, C, T)   <- save here for h_ln in (C, T) layout
+    #   [4] Mish           -> (B, C, T)   (already captured by block1 hook -> cfm_d0_rn_b1)
+    d0_b1_seq = d0_rn.block1.block
+    hooks.append(d0_b1_seq[0].register_forward_hook(
+        make_first_call_hook(storage, "cfm_h_conv")))
+    hooks.append(d0_b1_seq[3].register_forward_hook(
+        make_first_call_hook(storage, "cfm_h_ln")))
     # First transformer block in down_block 0
     d0_t0 = est.down_blocks[0][1][0]               # BasicTransformerBlock
     hooks.append(d0_t0.norm1.register_forward_hook(make_hook(storage, "cfm_d0_t0_n1", multi_call=True)))
@@ -204,6 +236,21 @@ def main():
         captured[f"cfm_step{step_idx[0]}_spks"] = spks.detach().clone().cpu() if spks is not None else None
         captured[f"cfm_step{step_idx[0]}_cond"] = cond.detach().clone().cpu() if cond is not None else None
         captured[f"cfm_step{step_idx[0]}_mask"] = mask.detach().clone().cpu() if mask is not None else None
+        # G2-gap fix: replicate the pack([x, mu, spks_bc, cond], dim=1)
+        # done inside ConditionalDecoder.forward so stage_G2 has its
+        # `cfm_concat.npy` reference.  Only capture from CFM step 0.
+        if step_idx[0] == 0:
+            try:
+                from einops import pack as _pack, repeat as _repeat
+                xc = _pack([x, mu], "b * t")[0]
+                if spks is not None:
+                    spks_bc = _repeat(spks, "b c -> b c t", t=x.shape[-1])
+                    xc = _pack([xc, spks_bc], "b * t")[0]
+                if cond is not None:
+                    xc = _pack([xc, cond], "b * t")[0]
+                captured["cfm_concat"] = xc.detach().clone().cpu()
+            except Exception as e:
+                print(f"  cfm_concat capture skipped: {e}")
         out = orig_est_forward(x, mask=mask, mu=mu, t=t, spks=spks, cond=cond, r=r)
         captured[f"cfm_step{step_idx[0]}_dxdt"] = out.detach().clone().cpu()
         step_idx[0] += 1
@@ -317,6 +364,23 @@ def main():
     # Note: m_source calls randn_like once more outside SineGen.
     # We use a counter to distinguish: first call is inside SineGen, second is the outer noise branch.
 
+    # G2-gap fix: capture s_stft (the cat'd real+imag STFT of the source
+    # signal).  HiFTGenerator.decode() does:
+    #   real, imag = self._stft(s.squeeze(1))
+    #   s_stft = torch.cat([real, imag], dim=1)
+    # The C++ stage_H3 / stage_H4 harnesses load `hift_s_stft.npy`, so
+    # capture it here by monkeypatching _stft.
+    orig_hift_stft = hift._stft
+    stft_seen = {"count": 0}
+    def _stft_capture(x):
+        real, imag = orig_hift_stft(x)
+        if stft_seen["count"] == 0:
+            s_stft = torch.cat([real, imag], dim=1)
+            hift_storage["hift_s_stft"] = s_stft.detach().clone().cpu()
+            stft_seen["count"] += 1
+        return real, imag
+    hift._stft = _stft_capture
+
     try:
         torch.manual_seed(args.seed + 1)  # Different seed so HiFT random is reproducible per run
         hift_cache = torch.zeros(1, 1, 0).to(tts.device)
@@ -325,6 +389,7 @@ def main():
         sg.forward = orig_sg_forward
         _Uniform.sample = orig_uniform_sample
         _torch.randn_like = orig_randn_like2
+        hift._stft = orig_hift_stft
         for h in hift_hooks:
             h.remove()
 
