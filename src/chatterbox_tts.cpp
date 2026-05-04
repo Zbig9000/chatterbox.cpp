@@ -57,6 +57,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // Global thread count (set in main; used to configure CPU backend in each graph run)
@@ -161,6 +162,12 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
 // belong in a server front-end.
 static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose);
 
+// QVAC-17872 round-HIFT: defined later (alongside cfm_estimator_cache).
+// Tears down the persistent CFM estimator graph cache.  Forward-declared
+// here so s3gen_model_cache_release / cache-miss can call it without
+// having to also move the struct definition + global instance up.
+static void g_cfm_estimator_cache_destroy();
+
 namespace {
 struct s3gen_cache_entry { std::string path; int gpu = 0; std::unique_ptr<model_ctx> m; };
 static std::mutex                            g_s3gen_cache_mu;
@@ -176,6 +183,13 @@ static double                                g_s3gen_cache_last_load_ms = 0.0;
 // insertion so it runs before process-exit dylib finalisers.
 static void s3gen_model_cache_release() {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
+    // QVAC-17872 round-HIFT: tear down the persistent CFM estimator graph
+    // BEFORE freeing the backend.  cfm_estimator_cache.allocr holds Vulkan
+    // (or Metal/CUDA) buffers allocated against the soon-to-be-freed
+    // backend; gallocr_free against a dangling vk_device asserts inside
+    // ggml-vulkan.  Same constraint as the existing thread_local
+    // time_mlp_cache documents.
+    g_cfm_estimator_cache_destroy();
     if (!g_s3gen_cache_entry) return;
     model_ctx * m = g_s3gen_cache_entry->m.get();
     if (m) {
@@ -198,6 +212,13 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
         }
         g_s3gen_cache_last_load_ms = 0.0;
         return g_s3gen_cache_entry->m.get();
+    }
+    // QVAC-17872 round-HIFT: backend swap (different path or n_gpu_layers).
+    // Tear down the persistent CFM estimator cache against the OLD backend
+    // before freeing it, then drop the s3gen_cache_entry.  Same reasoning as
+    // s3gen_model_cache_release.
+    if (g_s3gen_cache_entry) {
+        g_cfm_estimator_cache_destroy();
     }
     if (verbose) fprintf(stderr, "Loading %s\n", path.c_str());
     double t0 = now_ms();
@@ -315,14 +336,22 @@ static ggml_tensor * conv1d_f32_b(ggml_context * ctx, ggml_tensor * kernel, ggml
     return ggml_cont(ctx, ggml_permute(ctx, prod, 1, 0, 2, 3));
 }
 
+// QVAC-17872 round-HIFT (2026-05-04): drop the trailing ggml_cont.  The
+// only caller is run_hift_decode's upsample loop, where the result is
+// immediately consumed by ggml_add(x, ggml_reshape_2d(bias)) — same
+// strided-tolerant pattern as round-AUDIT's pre_lookahead exit cont.
+// The view's nb[1]/nb[2] are the original out's strides (which span the
+// pre-trim length), so element-wise add iterates with the proper byte
+// offsets.  After add, x is a fresh contiguous tensor again, so the
+// downstream ggml_view_3d / ggml_concat / rb_fwd → conv1d_f32 chain sees
+// contig input.  Saves 3 dispatches per HiFT decode (1 per ups stage).
 static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * kernel,
                                            ggml_tensor * input, int stride, int padding) {
     ggml_tensor * out = ggml_conv_transpose_1d(ctx, kernel, input, stride, 0, 1);
     if (padding == 0) return out;
     int64_t L_new = out->ne[0] - 2 * padding;
-    ggml_tensor * v = ggml_view_3d(ctx, out, L_new, out->ne[1], out->ne[2],
-                                   out->nb[1], out->nb[2], (size_t)padding * out->nb[0]);
-    return ggml_cont(ctx, v);
+    return ggml_view_3d(ctx, out, L_new, out->ne[1], out->ne[2],
+                        out->nb[1], out->nb[2], (size_t)padding * out->nb[0]);
 }
 
 // Metal backend currently has no PAD / PAD_EXT dispatcher entry, so emulate
@@ -970,6 +999,65 @@ static std::vector<float> compute_time_mixed(const model_ctx & m,
     return out;
 }
 
+// QVAC-17872 round-HIFT: memoised time-embedding pipeline.  Both Turbo
+// (meanflow, t_span = [0, 0.5, 1]) and multilingual (cosine-scheduled, 10
+// steps) produce the same set of t-values across all subsequent synth
+// calls — the t-embedding outputs are deterministic functions of t (and
+// the model weights), so we can cache them.
+//
+// Two-layer cache:
+//   - g_time_mlp_results: keyed by uint32_t bitcast of t_val, used by
+//     both paths.  Multilingual benefits the most (10 distinct t-values
+//     repeated across every synth).
+//   - g_time_emb_results: keyed by uint64_t = (kt << 32) | kr, ONLY
+//     used by Turbo (meanflow) since multilingual doesn't run the mixer.
+//
+// Cleared in g_cfm_estimator_cache_destroy alongside the graph cache.
+//
+// Bit-exactness: trivially preserved — same compute, just memoised.
+static std::unordered_map<uint32_t, std::vector<float>> g_time_mlp_results;
+static std::unordered_map<uint64_t, std::vector<float>> g_time_emb_results;
+static std::mutex                                       g_time_emb_results_mu;
+
+static std::vector<float> compute_time_mlp_cached(const model_ctx & m, float t_val) {
+    uint32_t key;
+    static_assert(sizeof(key) == sizeof(t_val), "float must be 32-bit for bitcast key");
+    std::memcpy(&key, &t_val, sizeof(key));
+    {
+        std::lock_guard<std::mutex> lk(g_time_emb_results_mu);
+        auto it = g_time_mlp_results.find(key);
+        if (it != g_time_mlp_results.end()) return it->second;
+    }
+    auto out = compute_time_mlp(m, t_val);
+    {
+        std::lock_guard<std::mutex> lk(g_time_emb_results_mu);
+        g_time_mlp_results.emplace(key, out);
+    }
+    return out;
+}
+
+// Used only by the meanflow (Turbo) path — multilingual doesn't run
+// time_embed_mixer.  Caches the full t_emb pipeline by (t, r) pair.
+static std::vector<float> compute_time_emb_cached(const model_ctx & m, float t_val, float r_val) {
+    uint32_t kt, kr;
+    std::memcpy(&kt, &t_val, sizeof(kt));
+    std::memcpy(&kr, &r_val, sizeof(kr));
+    const uint64_t key = ((uint64_t)kt << 32) | (uint64_t)kr;
+    {
+        std::lock_guard<std::mutex> lk(g_time_emb_results_mu);
+        auto it = g_time_emb_results.find(key);
+        if (it != g_time_emb_results.end()) return it->second;
+    }
+    auto t_mlp = compute_time_mlp_cached(m, t_val);
+    auto r_mlp = compute_time_mlp_cached(m, r_val);
+    auto out = compute_time_mixed(m, t_mlp, r_mlp);
+    {
+        std::lock_guard<std::mutex> lk(g_time_emb_results_mu);
+        g_time_emb_results.emplace(key, out);
+    }
+    return out;
+}
+
 // Cached CFM estimator state — graph is built once and reused across steps.
 //
 // Cache key is (T, b2): a graph built for batch=1 (cfm_estimator_forward) cannot
@@ -987,11 +1075,74 @@ struct cfm_estimator_cache {
     ggml_cgraph * gf = nullptr;
     ggml_gallocr_t allocr = nullptr;
     std::vector<uint8_t> buf;
+    // QVAC-17872 round-HIFT: explicit destroy() so the cache can be a
+    // process-global tied to the s3gen-model lifecycle.  See
+    // s3gen_model_cache_release: invoked BEFORE ggml_backend_free, which
+    // is the same constraint the existing thread_local time_mlp_cache
+    // documents (Vulkan/Metal device-teardown ordering at process exit).
+    void destroy() {
+        if (allocr) { ggml_gallocr_free(allocr); allocr = nullptr; }
+        if (ctx)    { ggml_free(ctx);            ctx    = nullptr; }
+        gf  = nullptr;
+        T   = -1;
+        b2  = false;
+        buf = std::vector<uint8_t>();
+    }
+    // Destructor kept as a safety net for non-cached usages (e.g. tests
+    // that allocate a cfm_estimator_cache on the stack).  The global
+    // g_cfm_estimator_cache is explicitly destroyed via
+    // s3gen_model_cache_release before backend teardown.
     ~cfm_estimator_cache() {
         if (allocr) ggml_gallocr_free(allocr);
         if (ctx) ggml_free(ctx);
     }
 };
+
+// QVAC-17872 round-HIFT: persistent CFM estimator graph.  Was local-scope
+// in s3gen_synthesize_to_wav() before, so every synth call paid the full
+// graph rebuild cost (CFM has ~5500 ggml ops + gallocr_reserve allocates
+// the device-side buffer pool).  Persistent global with explicit destroy()
+// eliminates the rebuild on synth calls 2..N when T matches.
+static cfm_estimator_cache g_cfm_estimator_cache;
+
+// QVAC-17872 round-HIFT: CPU-side mirror of large model weights that
+// synthesize() reads every call (input_embedding lookup table, speaker
+// affine matrix).  These are model constants — on a GPU backend each
+// call previously paid an N MB device→host download per synth.  Cleared
+// in g_cfm_estimator_cache_destroy alongside the graph cache.
+static std::unordered_map<const ggml_tensor *, std::vector<float>> g_weight_cpu_mirror;
+static std::mutex                                                  g_weight_cpu_mirror_mu;
+
+static const float * cached_cpu_weights_f32(const ggml_tensor * t) {
+    {
+        std::lock_guard<std::mutex> lk(g_weight_cpu_mirror_mu);
+        auto it = g_weight_cpu_mirror.find(t);
+        if (it != g_weight_cpu_mirror.end()) return it->second.data();
+    }
+    std::vector<float> data(ggml_nelements(t));
+    ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+    {
+        std::lock_guard<std::mutex> lk(g_weight_cpu_mirror_mu);
+        auto [it, inserted] = g_weight_cpu_mirror.emplace(t, std::move(data));
+        return it->second.data();
+    }
+}
+
+// Forward-declared near s3gen_model_cache_release; defined here so the
+// release path can flush the caches without having to also move the
+// cfm_estimator_cache struct definition + global up.
+static void g_cfm_estimator_cache_destroy() {
+    g_cfm_estimator_cache.destroy();
+    {
+        std::lock_guard<std::mutex> lk(g_time_emb_results_mu);
+        g_time_mlp_results.clear();
+        g_time_emb_results.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_weight_cpu_mirror_mu);
+        g_weight_cpu_mirror.clear();
+    }
+}
 
 // Single estimator forward: (x, mu, t_emb, spks, cond) -> dxdt
 // All shapes are numpy (80, T) or (80,) as given, flattened row-major.
@@ -1339,7 +1490,13 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, b, 1, C_out));
         x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
     }
-    ggml_tensor * xp = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
+    // QVAC-17872 round-HIFT (2026-05-04): drop the cont before the
+    // classifier matmul.  ggml_mul_mat src1 (xp here) is the activations
+    // input; Vulkan / Metal / CUDA mul_mat shaders all iterate by stride
+    // and accept strided src1 for f32 matmul.  Saves 1 dispatch / HiFT
+    // decode.  Verified bit-exact across all RTX 5090 + AMD/RADV
+    // invariants in the round-HIFT companion FINDINGS doc.
+    ggml_tensor * xp = ggml_permute(ctx, x, 1, 0, 2, 3);
     ggml_tensor * cw = find_tensor(m, "hift/f0_predictor/classifier/weight");
     ggml_tensor * cb = find_tensor(m, "hift/f0_predictor/classifier/bias");
     ggml_tensor * y = ggml_mul_mat(ctx, cw, xp);
@@ -1571,8 +1728,13 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     y = ggml_div(ctx, y, ws_in);
     int pad_amt = n_fft / 2;
     int L_wav = (int)ws.size() - n_fft;
-    ggml_tensor * y_trim = ggml_cont(ctx, ggml_view_2d(ctx, y, L_wav, y->ne[1], y->nb[1],
-                                                       (size_t)pad_amt * y->nb[0]));
+    // QVAC-17872 round-HIFT (2026-05-04): drop the trailing ggml_cont.  The
+    // view's only consumer is ggml_clamp (element-wise, accepts strided
+    // src0); clamp's output is a fresh contiguous tensor allocated by the
+    // gallocator.  ggml_set_output is set on that contig output, so
+    // tensor_get reads from a contig buffer.  Saves 1 dispatch / HiFT decode.
+    ggml_tensor * y_trim = ggml_view_2d(ctx, y, L_wav, y->ne[1], y->nb[1],
+                                        (size_t)pad_amt * y->nb[0]);
     y_trim = ggml_clamp(ctx, y_trim, -0.99f, 0.99f);
     ggml_set_name(y_trim, "wav"); ggml_set_output(y_trim);
     ggml_build_forward_expand(gf, y_trim);
@@ -1820,8 +1982,13 @@ int s3gen_synthesize_to_wav(
     // 2) input_embedding lookup + multiply by mask
     vlog("Running input_embedding...\n");
     ggml_tensor * emb_w = find_tensor(m, "flow/input_embedding");
-    std::vector<float> emb_w_data(ggml_nelements(emb_w));
-    ggml_backend_tensor_get(emb_w, emb_w_data.data(), 0, ggml_nbytes(emb_w));
+    // QVAC-17872 round-HIFT: input_embedding weight is multiple MB on Turbo
+    // and ~28 MB on multilingual (vocab=13632 × D=512 × 4 B).  Each synth
+    // call previously paid the full GPU→CPU download (~600-1000 µs wall
+    // on RTX 5090).  Cache the CPU mirror so subsequent calls only pay
+    // the cheap row-copy lookup cost.  Cache is bound to the s3gen model
+    // lifecycle.
+    const float * emb_w_data = cached_cpu_weights_f32(emb_w);
     vlog("  emb_w ne=[%lld, %lld]\n", (long long)emb_w->ne[0], (long long)emb_w->ne[1]);
     int vocab_size = (int)emb_w->ne[1];
     std::vector<float> input_embed(n_total * D);
@@ -1832,7 +1999,7 @@ int s3gen_synthesize_to_wav(
             fprintf(stderr, "warning: token %d out of range (vocab=%d), clamping\n", tok, vocab_size);
             tok = vocab_size - 1;
         }
-        std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)tok * D, D * sizeof(float));
+        std::memcpy(input_embed.data() + i * D, emb_w_data + (size_t)tok * D, D * sizeof(float));
     }
     if (debug_mode) {
         fprintf(stderr, "  token[0]=%d lookup: %.6f %.6f %.6f %.6f %.6f\n",
@@ -1919,9 +2086,10 @@ int s3gen_synthesize_to_wav(
 
     ggml_tensor * saw = find_tensor(m, "flow/spk_embed_affine/w");  // (80, 192) numpy -> ne=[192, 80]
     ggml_tensor * sab = find_tensor(m, "flow/spk_embed_affine/b");  // (80,)
-    std::vector<float> saw_data(ggml_nelements(saw)), sab_data(ggml_nelements(sab));
-    ggml_backend_tensor_get(saw, saw_data.data(), 0, ggml_nbytes(saw));
-    ggml_backend_tensor_get(sab, sab_data.data(), 0, ggml_nbytes(sab));
+    // QVAC-17872 round-HIFT: cache CPU mirrors of the speaker-affine
+    // weights (~60 KB) instead of paying GPU→CPU download per synth.
+    const float * saw_data = cached_cpu_weights_f32(saw);
+    const float * sab_data = cached_cpu_weights_f32(sab);
     std::vector<float> spks(MEL, 0.0f);
     for (int o = 0; o < MEL; ++o) {
         float acc = sab_data[o];
@@ -2064,19 +2232,29 @@ int s3gen_synthesize_to_wav(
     const bool use_b2 = (!meanflow) && (cfg_rate != 0.0f) &&
                         !ggml_backend_is_cpu(m.backend);
 
-    cfm_estimator_cache cfm_cache;
+    // QVAC-17872 round-HIFT: persistent CFM estimator graph cache
+    // (was local-scope before).  Re-used across synth calls when T matches —
+    // multi-synth chunks 2..N skip the graph build + gallocr_reserve cost
+    // they previously paid every chunk.  Lifetime managed by
+    // s3gen_model_cache_release.  Works for both batch=1 (Turbo) and
+    // batch=2 (multilingual CFG) paths via the cache.b2 flag.
+    cfm_estimator_cache & cfm_cache = g_cfm_estimator_cache;
     double cfm_t0 = now_ms();
     for (size_t s = 0; s < t_span.size() - 1; ++s) {
         float t = t_span[s], r = t_span[s + 1];
         float dt = r - t;
         vlog("CFM step %zu: t=%g r=%g dt=%g...\n", s, t, r, dt);
-        auto t_mlp = compute_time_mlp(m, t);
+        // QVAC-17872 round-HIFT: memoised t-emb pipeline.  Same (t, r)
+        // pair always produces the same vector (deterministic functions of
+        // t, r and the model weights).  Both Turbo (meanflow) and
+        // multilingual (standard) paths benefit; multilingual amortises
+        // the cache better since it has 10 steps × 2 sets of {t, r}
+        // values that repeat across every subsequent synth call.
         std::vector<float> t_emb;
         if (meanflow) {
-            auto r_mlp = compute_time_mlp(m, r);
-            t_emb = compute_time_mixed(m, t_mlp, r_mlp);
+            t_emb = compute_time_emb_cached(m, t, r);
         } else {
-            t_emb = std::move(t_mlp);
+            t_emb = compute_time_mlp_cached(m, t);
         }
 
         if (debug_mode && meanflow) {

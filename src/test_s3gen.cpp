@@ -1109,6 +1109,12 @@ static void stage_G2(const model_ctx & m, const std::string & ref_dir) {
     ggml_tensor * xc = ggml_concat(ctx, x_in, mu_in, 1);
     xc = ggml_concat(ctx, xc, spks_bc, 1);
     xc = ggml_concat(ctx, xc, cond_in, 1);
+    // QVAC-17872 round-HIFT/G2-fix: mark xc as graph output so the gallocator
+    // preserves its buffer across compute (otherwise the diagnostic read of
+    // xc returns garbage, since xc's slot gets reused by downstream
+    // intermediates after the conv1d consumer completes).  cfm_concat.npy
+    // is now produced by dump-s3gen-reference.py (round-HIFT G2-gap closure).
+    ggml_set_name(xc, "xc"); ggml_set_output(xc);
 
     auto rn_w = load_cfm_resnet(m, "cfm/down_blocks/0/0");
 

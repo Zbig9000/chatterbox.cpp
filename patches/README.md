@@ -8,11 +8,14 @@ standalone patches and are applied after the clone.
 |--------|------------------|
 | `ggml-metal-chatterbox-ops.patch` | Building with **Metal** (Apple Silicon T3 + full pipeline). |
 | `ggml-opencl-chatterbox-ops.patch` | Building with **OpenCL** (e.g. Android / Termux + Adreno: `CONV_TRANSPOSE_1D` for HiFT, `SIN`, backend notes). |
-| (none) | **CPU** / **CUDA** / **Vulkan** only — stock upstream `ggml` is enough. |
+| `ggml-vulkan-pipeline-cache.patch` | Building with **Vulkan** — opt-in persistent `VkPipelineCache` keyed by `<vendorID>-<deviceID>-<driverVersion>`.  Recovers ~91 % of the cold→warm gap on the first warm run.  Disabled by `GGML_VK_PIPELINE_CACHE_DIR=""`. |
+| `ggml-vulkan-eager-cache-save.patch` | Building with **Vulkan** — write back the pipeline cache after every `ggml_vk_load_shaders` compile batch (crash-safety against SIGKILL/abort losing freshly compiled pipelines).  Stacks on the previous patch. |
+| (none) | **CPU** / **CUDA** only — stock upstream `ggml` is enough. |
 
-`setup-ggml.sh` always applies **both** patches in order (Metal, then
-OpenCL).  Extra OpenCL code is inert when you configure without
-`GGML_OPENCL=ON`.
+`setup-ggml.sh` always applies **all four** patches in order (Metal,
+OpenCL, Vulkan-pipeline-cache, Vulkan-eager-cache-save).  Each is
+inert when you configure without the corresponding backend
+(`GGML_METAL=ON` / `GGML_OPENCL=ON` / `GGML_VULKAN=ON`).
 
 ## Apply
 
@@ -46,6 +49,8 @@ git clone https://github.com/ggml-org/ggml.git ggml
 cd ggml && git reset --hard $GGML_COMMIT && git clean -fdq
 git apply ../patches/ggml-metal-chatterbox-ops.patch
 git apply ../patches/ggml-opencl-chatterbox-ops.patch
+git apply ../patches/ggml-vulkan-pipeline-cache.patch
+git apply ../patches/ggml-vulkan-eager-cache-save.patch
 ```
 
 `GGML_COMMIT` lives at the top of `scripts/setup-ggml.sh` as the
